@@ -562,6 +562,27 @@ impl WhatsAppWebChannel {
         retry_count.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Expand `~` in a configured `session_path`. Single source of truth
+    /// for the on-disk location — the run loop and the readiness probe
+    /// must agree on the file they are looking at.
+    fn expand_session_path(session_path: &str) -> String {
+        shellexpand::tilde(session_path).to_string()
+    }
+
+    /// Channel-owned persisted-login probe: reports whether the session
+    /// database at the configured `session_path` holds a device linked to a
+    /// WhatsApp account (`device.pn` written by a completed QR pairing).
+    /// Stricter than the run loop's resume check on purpose — a channel
+    /// waiting for its QR scan persists an unregistered device row, which
+    /// must not read as an authenticated login. Read-only; never creates
+    /// the database or its sidecar files.
+    pub fn has_persisted_session(session_path: &str) -> bool {
+        if session_path.is_empty() {
+            return false;
+        }
+        super::whatsapp_storage::persisted_device_exists(Self::expand_session_path(session_path))
+    }
+
     /// Return the session file paths to remove (primary + WAL + SHM sidecars).
     fn session_file_paths(expanded_session_path: &str) -> [String; 3] {
         [
@@ -569,6 +590,34 @@ impl WhatsAppWebChannel {
             format!("{expanded_session_path}-wal"),
             format!("{expanded_session_path}-shm"),
         ]
+    }
+
+    /// Channel-owned relink hook: delete the persisted session so the next
+    /// channel start finds no device and begins a fresh QR pairing.
+    ///
+    /// Removes the same triple the logged-out purge path removes —
+    /// [`Self::session_file_paths`] is the single source of truth for both.
+    /// Returns the paths actually removed; already absent files are not an
+    /// error, so relinking an unpaired channel is a safe no-op that returns
+    /// an empty list. Never creates the database.
+    ///
+    /// This only clears disk state. A currently running channel keeps its
+    /// live connection until it is restarted; callers own scheduling that
+    /// restart (e.g. a daemon reload).
+    pub fn clear_persisted_session(session_path: &str) -> std::io::Result<Vec<String>> {
+        let mut removed = Vec::new();
+        if session_path.is_empty() {
+            return Ok(removed);
+        }
+        let expanded = Self::expand_session_path(session_path);
+        for path in Self::session_file_paths(&expanded) {
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed.push(path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(removed)
     }
 
     /// Attempt to download and transcribe a WhatsApp voice note.
@@ -1935,7 +1984,7 @@ impl Channel for WhatsAppWebChannel {
         let retry_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
         loop {
-            let expanded_session_path = shellexpand::tilde(&self.session_path).to_string();
+            let expanded_session_path = Self::expand_session_path(&self.session_path);
 
             ::zeroclaw_log::record!(
                 INFO,
@@ -2772,6 +2821,39 @@ mod tests {
     use super::*;
     #[cfg(feature = "whatsapp-web")]
     use wacore_binary::jid::Jid;
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn clear_persisted_session_removes_db_triple_and_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("session.db");
+        let db_str = db.to_string_lossy().into_owned();
+        std::fs::write(&db, b"db").unwrap();
+        std::fs::write(format!("{db_str}-wal"), b"wal").unwrap();
+        std::fs::write(format!("{db_str}-shm"), b"shm").unwrap();
+
+        let removed = WhatsAppWebChannel::clear_persisted_session(&db_str).unwrap();
+        assert_eq!(removed.len(), 3);
+        for path in WhatsAppWebChannel::session_file_paths(&db_str) {
+            assert!(
+                !std::path::Path::new(&path).exists(),
+                "{path} must be removed"
+            );
+        }
+
+        // Relinking an already unpaired channel is a safe no-op that
+        // must not create the database.
+        let removed = WhatsAppWebChannel::clear_persisted_session(&db_str).unwrap();
+        assert!(removed.is_empty());
+        assert!(!db.exists());
+
+        // Empty session_path (channel saved without one) clears nothing.
+        assert!(
+            WhatsAppWebChannel::clear_persisted_session("")
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[test]
     #[cfg(feature = "whatsapp-web")]

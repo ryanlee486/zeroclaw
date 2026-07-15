@@ -46,6 +46,12 @@ const QR_SCAN_TIMEOUT: Duration = Duration::from_secs(480);
 
 const WECHAT_BIND_COMMAND: &str = "/bind";
 
+/// State-dir file holding the persisted bot token / account identity.
+/// Single source of truth for every reader, writer, and the relink purge.
+const ACCOUNT_FILE: &str = "account.json";
+/// State-dir file holding the persisted sync cursor and context tokens.
+const SYNC_FILE: &str = "sync.json";
+
 /// iLink Bot message types.
 const MESSAGE_TYPE_BOT: u32 = 2;
 /// iLink Bot message state.
@@ -715,11 +721,7 @@ impl WeChatChannel {
             Some(guard)
         };
 
-        let state_dir = state_dir.unwrap_or_else(|| {
-            directories::UserDirs::new()
-                .map(|u| u.home_dir().join(".zeroclaw").join("wechat"))
-                .unwrap_or_else(|| PathBuf::from(".zeroclaw/wechat"))
-        });
+        let state_dir = state_dir.unwrap_or_else(Self::default_state_dir);
 
         let mut channel = Self {
             bot_token: RwLock::new(None),
@@ -758,12 +760,71 @@ impl WeChatChannel {
         self
     }
 
+    /// Default state directory when `[channels.wechat.<alias>] state_dir`
+    /// is unset: `~/.zeroclaw/wechat`.
+    fn default_state_dir() -> PathBuf {
+        directories::UserDirs::new()
+            .map(|u| u.home_dir().join(".zeroclaw").join("wechat"))
+            .unwrap_or_else(|| PathBuf::from(".zeroclaw/wechat"))
+    }
+
+    /// Resolve the effective state directory from the raw
+    /// `[channels.wechat.<alias>] state_dir` config value: tilde-expanded
+    /// when set, [`Self::default_state_dir`] otherwise. Single source of
+    /// truth for every consumer of the config value — channel construction
+    /// and the readiness probe must agree on the directory.
+    pub fn resolve_state_dir(configured: Option<&str>) -> PathBuf {
+        match configured {
+            Some(path) => PathBuf::from(shellexpand::tilde(path).as_ref()),
+            None => Self::default_state_dir(),
+        }
+    }
+
+    /// Read `account.json` from a state directory, if present and parseable.
+    fn read_account_data(state_dir: &Path) -> Option<AccountData> {
+        let data = std::fs::read_to_string(state_dir.join(ACCOUNT_FILE)).ok()?;
+        serde_json::from_str::<AccountData>(&data).ok()
+    }
+
+    /// Channel-owned persisted-login probe: reports whether this state
+    /// directory holds the same signal [`Self::load_persisted_state`] uses
+    /// to resume a session without a fresh QR scan — an `account.json`
+    /// carrying a non-empty bot token. Read-only; never creates files.
+    pub fn has_persisted_login(state_dir: &Path) -> bool {
+        Self::read_account_data(state_dir)
+            .and_then(|account| account.token)
+            .is_some_and(|token| !token.is_empty())
+    }
+
+    /// Channel-owned relink hook: delete the persisted login state so the
+    /// next channel start finds no session and begins a fresh QR pairing.
+    ///
+    /// Removes exactly the files this module persists — [`ACCOUNT_FILE`]
+    /// (the bot token, i.e. the credential) and [`SYNC_FILE`] (the sync
+    /// cursor, which belongs to the replaced session) — and never the
+    /// directory itself. Returns the paths actually removed; an already
+    /// absent file is not an error, so relinking an unpaired channel is a
+    /// safe no-op that returns an empty list.
+    ///
+    /// This only clears disk state. A currently running channel keeps its
+    /// in-memory token until it is restarted; callers own scheduling that
+    /// restart (e.g. a daemon reload).
+    pub fn clear_persisted_login(state_dir: &Path) -> std::io::Result<Vec<String>> {
+        let mut removed = Vec::new();
+        for file in [ACCOUNT_FILE, SYNC_FILE] {
+            let path = state_dir.join(file);
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed.push(path.display().to_string()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(removed)
+    }
+
     /// Load persisted token and cursor from state_dir.
     fn load_persisted_state(&mut self) {
-        let account_path = self.state_dir.join("account.json");
-        if let Ok(data) = std::fs::read_to_string(&account_path)
-            && let Ok(account) = serde_json::from_str::<AccountData>(&data)
-        {
+        if let Some(account) = Self::read_account_data(&self.state_dir) {
             if let Some(ref token) = account.token
                 && !token.is_empty()
             {
@@ -779,7 +840,7 @@ impl WeChatChannel {
             }
         }
 
-        let sync_path = self.state_dir.join("sync.json");
+        let sync_path = self.state_dir.join(SYNC_FILE);
         if let Ok(data) = std::fs::read_to_string(&sync_path)
             && let Ok(sync) = serde_json::from_str::<SyncData>(&data)
         {
@@ -821,7 +882,7 @@ impl WeChatChannel {
             user_id: user_id.map(String::from),
             saved_at: Some(chrono::Utc::now().to_rfc3339()),
         };
-        let path = self.state_dir.join("account.json");
+        let path = self.state_dir.join(ACCOUNT_FILE);
         match serde_json::to_string_pretty(&data) {
             Ok(json) => {
                 if let Err(e) = write_private(&path, json.as_bytes()) {
@@ -860,7 +921,7 @@ impl WeChatChannel {
             get_updates_buf: self.cursor.lock().clone(),
             context_tokens: self.context_tokens.lock().clone(),
         };
-        let path = self.state_dir.join("sync.json");
+        let path = self.state_dir.join(SYNC_FILE);
         match serde_json::to_string(&data) {
             Ok(json) => {
                 if let Err(e) = write_private(&path, json.as_bytes()) {
@@ -2528,6 +2589,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ch.name(), "wechat");
+    }
+
+    #[test]
+    fn has_persisted_login_requires_non_empty_account_token() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+
+        assert!(!WeChatChannel::has_persisted_login(dir));
+
+        // A token cleared on logout is not a persisted login.
+        std::fs::write(dir.join("account.json"), r#"{"token": ""}"#).unwrap();
+        assert!(!WeChatChannel::has_persisted_login(dir));
+
+        std::fs::write(
+            dir.join("account.json"),
+            r#"{"token": "tok_persisted", "account_id": "acct_1"}"#,
+        )
+        .unwrap();
+        assert!(WeChatChannel::has_persisted_login(dir));
+    }
+
+    #[test]
+    fn clear_persisted_login_removes_state_files_and_is_idempotent() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        std::fs::write(dir.join("account.json"), r#"{"token": "tok_persisted"}"#).unwrap();
+        std::fs::write(dir.join("sync.json"), r#"{"get_updates_buf": "cursor"}"#).unwrap();
+
+        let removed = WeChatChannel::clear_persisted_login(dir).unwrap();
+        assert_eq!(removed.len(), 2);
+        assert!(!dir.join("account.json").exists());
+        assert!(!dir.join("sync.json").exists());
+        assert!(!WeChatChannel::has_persisted_login(dir));
+        assert!(dir.exists(), "the state directory itself must survive");
+
+        // Relinking an already unpaired channel is a safe no-op.
+        let removed = WeChatChannel::clear_persisted_login(dir).unwrap();
+        assert!(removed.is_empty());
     }
 
     #[test]
